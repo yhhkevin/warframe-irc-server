@@ -1,20 +1,27 @@
 #include <iostream>
 
-#include <CertStore.hpp>
+
 #include <console.hpp>
 #include <dnsOsResolver.hpp>
 #include <HttpRequestTask.hpp>
 #include <IrcServer.hpp>
 #include <json.hpp>
 #include <netConfig.hpp>
-#include <pem.hpp>
+
 #include <ServerWebService.hpp>
 #include <sha256.hpp>
 #include <Socket.hpp>
-#include <TlsCipherSuite.hpp>
-#include <TlsClientHello.hpp>
+
 #include <urlenc.hpp>
-#include <X509Certchain.hpp>
+
+#include <openssl/ssl.h>
+#include <openssl/err.h>
+#include <thread>
+#include <vector>
+#include <cstring>
+#include <winsock2.h>
+#include <ws2tcpip.h>
+#pragma comment(lib, "ws2_32.lib")
 
 #ifdef DOCKER
 #include <signal.h>
@@ -41,8 +48,6 @@ static std::string create_token(const std::string& accountId, const std::string&
 }
 
 struct AuthPendingTag {};
-
-struct NoXplayTag {};
 
 struct AuthenticatedUserData
 {
@@ -247,6 +252,7 @@ struct LoggingIrcServer : public soup::IrcServer
 					{
 						//s.send(":Soup WALLOPS :Your client sent your accountId-nonce pair (granting full account access) over an insecure transport.\r\n");
 						token = create_token(accountId, realname.substr(6));
+						// std::cout << s.toString() << " | " << token << "\n";
 					}
 					else if (realname.size() != 40) // U8 and below
 					{
@@ -263,41 +269,6 @@ struct LoggingIrcServer : public soup::IrcServer
 			else
 			{
 				s.send(":Soup WALLOPS :Your client did not provide credentials. You will be chatting unauthenticated.\r\n");
-			}
-		}
-		else if (line.substr(0, 4) == "NICK")
-		{
-			if (line.substr(line.size() - 3) != "")
-			{
-				// Fixup the nick for pre-U32 clients to have a platform suffix.
-				const_cast<std::string&>(line).append("");
-				s.custom_data.addStructToMap(NoXplayTag, NoXplayTag{});
-			}
-		}
-		else if (line.substr(0, 4) == "PRIV")
-		{
-			if (auto sep = line.find(' ', 8); sep != std::string::npos)
-			{
-				auto channel_name = line.substr(8, sep - 8);
-				if (auto client = getClient(channel_name); client.isValid())
-				{
-					if (client.socket->custom_data.isStructInMap(NoXplayTag))
-					{
-						// Fixup DMs so pre-U32 clients can receive them.
-
-						IrcClientData& cd = s.custom_data.getStructFromMap(IrcClientData);
-
-						std::string msg(1, ':');
-						msg.append(cd.nick);
-						msg.push_back('!');
-						msg.append(cd.name);
-						msg.append("@Soup PRIVMSG ");
-						msg.append(channel_name.substr(0, channel_name.size() - 3));
-						msg.append(line.substr(sep));
-						msg.append("\r\n");
-						client.socket->send(msg);
-					}
-				}
 			}
 		}
 	}
@@ -339,18 +310,150 @@ struct LoggingIrcServer : public soup::IrcServer
 	}
 };
 
-// Try to pick an ECDHE ciphersuite first so that even if our private key is not-so-private a passive listener can't decrypt our traffic.
-static TlsCipherSuite_t select_ciphersuite(Socket& s, const TlsClientHello& hello)
+static SSL_CTX* g_ssl_ctx = nullptr;
+
+void handle_tls_connection(SOCKET client_fd)
 {
-	for (const auto& cs : hello.cipher_suites)
+	SSL* ssl = SSL_new(g_ssl_ctx);
+	SSL_set_fd(ssl, (int)client_fd);   // OpenSSL 需要 int
+
+	if (SSL_accept(ssl) <= 0)
 	{
-		if (tls_serverSupportsCipherSuite(cs) && tls_isEcdheCiphersuite(cs))
+		ERR_print_errors_fp(stderr);
+		closesocket(client_fd);
+		SSL_free(ssl);
+		return;
+	}
+
+	// 连接本地明文 IRC 端口 6667
+	int backend_fd = socket(AF_INET, SOCK_STREAM, 0);
+	sockaddr_in addr{};
+	addr.sin_family = AF_INET;
+	addr.sin_port = htons(6667);
+	inet_pton(AF_INET, "127.0.0.1", &addr.sin_addr);
+
+	if (connect(backend_fd, (sockaddr*)&addr, sizeof(addr)) == SOCKET_ERROR)
+	{
+		perror("connect to backend 6667");
+		SSL_shutdown(ssl);
+		SSL_free(ssl);
+		closesocket(client_fd);
+		return;
+	}
+
+	// 双向转发
+	char buf[4096];
+	while (true)
+	{
+		fd_set fds;
+		FD_ZERO(&fds);
+		FD_SET(client_fd, &fds);
+		FD_SET(backend_fd, &fds);
+
+		if (select(0, &fds, nullptr, nullptr, nullptr) == SOCKET_ERROR)
+			break;
+
+		if (FD_ISSET(client_fd, &fds))
 		{
-			return cs;
+			int n = SSL_read(ssl, buf, sizeof(buf));
+			if (n <= 0) break;
+			send(backend_fd, buf, n, 0);
+		}
+		if (FD_ISSET(backend_fd, &fds))
+		{
+			int n = recv(backend_fd, buf, sizeof(buf), 0);
+			if (n <= 0) break;
+			SSL_write(ssl, buf, n);
 		}
 	}
-	return Socket::default_select_ciphersuite(s, hello);
+
+	SSL_shutdown(ssl);
+	SSL_free(ssl);
+	closesocket(client_fd);
+	closesocket(backend_fd);
 }
+
+void start_tls_proxy(uint16_t listen_port)
+{
+	// OpenSSL 初始化只需一次，放到 main() 里做更合适（见下方说明）
+	// 这里直接使用全局的 g_ssl_ctx
+
+	SOCKET listen_fd = socket(AF_INET, SOCK_STREAM, 0);
+	if (listen_fd == INVALID_SOCKET)
+	{
+		std::cerr << "socket() failed for port " << listen_port
+			<< ": " << WSAGetLastError() << std::endl;
+		return;
+	}
+
+	int opt = 1;
+	setsockopt(listen_fd, SOL_SOCKET, SO_REUSEADDR, (const char*)&opt, sizeof(opt));
+
+	sockaddr_in addr{};
+	addr.sin_family = AF_INET;
+	addr.sin_port = htons(listen_port);
+	addr.sin_addr.s_addr = INADDR_ANY;
+
+	if (bind(listen_fd, (sockaddr*)&addr, sizeof(addr)) == SOCKET_ERROR)
+	{
+		std::cerr << "bind() failed for port " << listen_port
+			<< ": " << WSAGetLastError() << std::endl;
+		closesocket(listen_fd);
+		return;
+	}
+
+	if (listen(listen_fd, 10) == SOCKET_ERROR)
+	{
+		std::cerr << "listen() failed for port " << listen_port
+			<< ": " << WSAGetLastError() << std::endl;
+		closesocket(listen_fd);
+		return;
+	}
+
+	std::cout << "TLS proxy listening on " << listen_port
+		<< ", forwarding to 6667" << std::endl;
+
+	while (true)
+	{
+		SOCKET client_fd = accept(listen_fd, nullptr, nullptr);
+		if (client_fd != INVALID_SOCKET)
+		{
+			std::thread(handle_tls_connection, client_fd).detach();
+		}
+	}
+}
+
+bool init_openssl()
+{
+	SSL_library_init();
+	SSL_load_error_strings();
+	OpenSSL_add_all_algorithms();
+
+	g_ssl_ctx = SSL_CTX_new(TLS_server_method());
+	if (!g_ssl_ctx)
+	{
+		ERR_print_errors_fp(stderr);
+		return false;
+	}
+
+	SSL_CTX_set_min_proto_version(g_ssl_ctx, TLS1_3_VERSION);
+	SSL_CTX_set_max_proto_version(g_ssl_ctx, TLS1_3_VERSION);
+
+	if (SSL_CTX_use_certificate_file(g_ssl_ctx, "cert/cert.pem", SSL_FILETYPE_PEM) <= 0 ||
+		SSL_CTX_use_PrivateKey_file(g_ssl_ctx, "cert/key.pem", SSL_FILETYPE_PEM) <= 0)
+	{
+		ERR_print_errors_fp(stderr);
+		return false;
+	}
+	if (SSL_CTX_check_private_key(g_ssl_ctx) != 1)
+	{
+		std::cerr << "Private key does not match certificate" << std::endl;
+		return false;
+	}
+	return true;
+}
+
+// Try to pick an ECDHE ciphersuite first so that even if our private key is not-so-private a passive listener can't decrypt our traffic.
 
 #ifdef DOCKER
 	#define CONFIG_PATH "conf/irc_config.json"
@@ -360,6 +463,12 @@ static TlsCipherSuite_t select_ciphersuite(Socket& s, const TlsClientHello& hell
 
 int main()
 {
+	WSADATA wsaData;
+	if (WSAStartup(MAKEWORD(2, 2), &wsaData) != 0)
+	{
+		std::cerr << "WSAStartup failed" << std::endl;
+		return 1;
+	}
 	try
 	{
 		soup::console.init(false);
@@ -406,37 +515,28 @@ int main()
 			std::cerr << "Could not find a cert folder in the working directory\n";
 			return 1;
 		}
-		auto certstore = soup::make_shared<soup::CertStore>();
+
+		// Soup 只监听明文端口 6667
+		if (!serv.bind(6667, &serv.srv))
 		{
-			soup::X509Certchain certchain;
-			certchain.fromDer(soup::pem::decodeChain(soup::string::fromFile("cert/cert.pem")));
-			auto private_key = soup::RsaPrivateKey::fromPem(soup::string::fromFile("cert/key.pem"));
-			certstore->add(std::move(certchain), std::move(private_key));
-		}
-		if (!serv.bindCrypto(6695, &serv.srv, certstore, &select_ciphersuite)
-			|| !serv.bindCrypto(6696, &serv.srv, certstore, &select_ciphersuite)
-			|| !serv.bindCrypto(6697, &serv.srv, certstore, &select_ciphersuite)
-			|| !serv.bindCrypto(6698, &serv.srv, certstore, &select_ciphersuite)
-			|| !serv.bindCrypto(6699, &serv.srv, certstore, &select_ciphersuite)
-			)
-		{
-			std::cerr << "Failed to bind to ports 6695-6699\n";
+			std::cerr << "Failed to bind to port 6667\n";
+			WSACleanup();
 			return 1;
 		}
-		std::cout << "Listening for TLS traffic on 6695-6699\n";
+		std::cout << "Listening for plaintext IRC on 6667" << std::endl;
 
-		if (serv.bindOptCrypto(6665, &serv.srv, certstore, &select_ciphersuite)
-			&& serv.bindOptCrypto(6666, &serv.srv, certstore, &select_ciphersuite)
-			&& serv.bindOptCrypto(6667, &serv.srv, certstore, &select_ciphersuite)
-			&& serv.bindOptCrypto(6668, &serv.srv, certstore, &select_ciphersuite)
-			&& serv.bindOptCrypto(6669, &serv.srv, certstore, &select_ciphersuite)
-			)
+		// 初始化 OpenSSL
+		if (!init_openssl())
 		{
-			std::cout << "Listening for unencrypted traffic on 6665-6669\n";
+			std::cerr << "OpenSSL initialization failed" << std::endl;
+			WSACleanup();
+			return 1;
 		}
-		else
+
+		// 为 6695-6699 每个端口启动一个 TLS 代理线程
+		for (uint16_t port = 6695; port <= 6699; ++port)
 		{
-			std::cout << "Failed to bind to ports 6665-6669, won't be listening for unencrypted traffic\n";
+			std::thread(start_tls_proxy, port).detach();
 		}
 
 		ServerWebService web_srv([](soup::Socket& s, soup::HttpRequest&& req, soup::ServerWebService&)
@@ -493,6 +593,10 @@ int main()
 	catch (std::exception& e)
 	{
 		std::cerr << e.what() << std::endl;
+		WSACleanup();
 		return 1;
 	}
+
+	WSACleanup();
+	return 0;
 }
