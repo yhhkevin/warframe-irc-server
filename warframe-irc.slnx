@@ -1,0 +1,7 @@
+<Solution>
+  <Configurations>
+    <Platform Name="x64" />
+    <Platform Name="x86" />
+  </Configurations>
+  <Project Path="warframe-irc/warframe-irc.vcxproj" Id="1c7a28d4-0a3e-4471-bef6-83bf26321392" />
+</Solution>
